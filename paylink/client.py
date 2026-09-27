@@ -6,6 +6,7 @@ the resulting safety decisions are documented in ``SOLUTION.md``.
 
 import hashlib
 import json
+import math
 import re
 import time
 from dataclasses import dataclass
@@ -138,6 +139,7 @@ class Client:
         filtering has to happen after every page has been read.
         """
         values = [Charge.from_json(item) for item in self._list_pages("/v1/charges")]
+        _require_unique_ids(values, "charge")
         if not reference:
             return values
         return [value for value in values if value.reference == reference]
@@ -162,6 +164,7 @@ class Client:
 
     def list_refunds(self, charge_id: str) -> list[Refund]:
         values = [Refund.from_json(item) for item in self._list_pages("/v1/refunds")]
+        _require_unique_ids(values, "refund")
         if not charge_id:
             return values
         return [value for value in values if value.charge_id == charge_id]
@@ -250,10 +253,18 @@ def _key(operation: str, *parts: str) -> str:
     return f"orders-{operation}-" + hashlib.sha256(material).hexdigest()
 
 
+def _require_unique_ids(values, kind: str) -> None:
+    ids = [value.id for value in values]
+    if len(ids) != len(set(ids)):
+        raise PaylinkError(f"paylink: duplicate {kind} id in list response")
+
+
 def _retry_after(value: str | None) -> float:
     try:
         delay = float(value or "1")
-    except ValueError:
+    except (TypeError, ValueError):
+        delay = 1.0
+    if not math.isfinite(delay):
         delay = 1.0
     return max(0.0, min(delay, 30.0))
 

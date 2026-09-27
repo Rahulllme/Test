@@ -106,6 +106,33 @@ def test_rate_limit_honors_retry_after():
     assert slept == [2.0]
 
 
+def test_non_finite_retry_after_uses_a_bounded_default():
+    slept = []
+    client = paylink.Client("https://paylink.test", sleep=slept.append)
+    client._session = Session(
+        [
+            Response(429, {"error": "rate_limited"}, {"Retry-After": "nan"}),
+            Response(200, {"data": []}),
+        ]
+    )
+
+    assert client.list_charges("") == []
+    assert slept == [1.0]
+
+
+def test_duplicate_ids_across_pages_make_the_snapshot_unusable():
+    client = paylink.Client("https://paylink.test", sleep=lambda _: None)
+    client._session = Session(
+        [
+            Response(200, {"data": [charge("ch_same", "one")], "next_cursor": "next"}),
+            Response(200, {"data": [charge("ch_same", "two")]}),
+        ]
+    )
+
+    with pytest.raises(paylink.PaylinkError, match="duplicate charge id"):
+        client.list_charges("")
+
+
 def test_malformed_list_evidence_is_rejected_instead_of_silently_dropped():
     client = paylink.Client("https://paylink.test", sleep=lambda _: None)
     client._session = Session([Response(200, {"data": ["not-a-charge"]})])

@@ -207,12 +207,15 @@ def test_temporary_provider_failure_is_retried_and_can_recover(f):
 
 def test_malformed_success_response_does_not_mark_order_paid(f):
     def malformed(reference, amount, card_token):
+        now = f.clock.now()
         return paylink.Charge(
             id="ch_wrong",
             reference=reference,
             amount=amount + 1,
             currency="JPY",
             status="succeeded",
+            created_at=now,
+            updated_at=now,
         )
 
     f.provider.create_charge = malformed
@@ -239,6 +242,21 @@ def test_idempotency_conflict_is_not_misclassified_as_a_failed_charge(f):
     assert charge.attempts == 1
 
 
+def test_malformed_charge_object_is_recorded_as_unknown_without_crashing(f):
+    f.provider.create_charge = lambda reference, amount, card_token: {"status": "succeeded"}
+
+    response = f.post(
+        "/orders", place_order("ord-invalid-object", "shape@example.com", 4250, "tok_visa")
+    )
+
+    assert response.status_code == 201, response.content
+    assert response.json()["status"] == Status.PENDING
+    charge = f.service.charges("ord-invalid-object")[0]
+    assert charge.provider_charge_id == ""
+    assert charge.status == ChargeStatus.UNKNOWN
+    assert "invalid charge object" in charge.last_error
+
+
 def test_refund_marks_the_order_refunded(f):
     assert f.post("/orders", place_order("ord-3005", "e@example.com", 6000, "tok_visa")).status_code == 201
     f.clock.set(f.clock.now() + timedelta(hours=1))
@@ -254,6 +272,26 @@ def test_refund_retry_does_not_issue_a_second_refund(f):
     assert f.post("/orders/ord-refund-once/refund").status_code == 200
     assert f.post("/orders/ord-refund-once/refund").status_code == 200
     assert len(f.provider.list_refunds("")) == 1
+
+
+def test_refund_stops_when_provider_history_contains_an_unresolved_result(f):
+    assert f.post("/orders", place_order("ord-refund-unknown", "u@example.com", 6110, "tok_visa")).status_code == 201
+    charge_id = f.service.charges("ord-refund-unknown")[0].provider_charge_id
+    f.provider.refunds.append(
+        paylink.Refund(
+            id="rf_unresolved",
+            charge_id=charge_id,
+            amount=6110,
+            status="pending",
+            created_at=f.clock.now(),
+        )
+    )
+
+    response = f.post("/orders/ord-refund-unknown/refund")
+
+    assert response.status_code == 500
+    assert f.service.get("ord-refund-unknown").status == Status.PAID
+    assert len(f.provider.refunds) == 1
 
 
 def test_refund_response_without_provider_id_does_not_mark_order_refunded(f):
@@ -408,3 +446,25 @@ def test_reconcile_does_not_settle_a_mismatched_amount(f):
     assert report.settled == []
     assert report.unresolved == ["ord-mismatch"]
     assert f.service.get("ord-mismatch").status == Status.PENDING
+
+
+def test_reconcile_rejects_a_snapshot_with_duplicate_provider_ids(f):
+    assert f.post("/orders", place_order("ord-duplicate-id", "di@example.com", 8200, "tok_3ds")).status_code == 201
+    duplicate = f.provider.charges[0]
+    f.provider.charges.append(
+        paylink.Charge(
+            id=duplicate.id,
+            reference=duplicate.reference,
+            amount=duplicate.amount,
+            currency=duplicate.currency,
+            status="succeeded",
+            created_at=duplicate.created_at,
+            updated_at=duplicate.updated_at,
+        )
+    )
+
+    report = f.service.reconcile()
+
+    assert report.settled == []
+    assert report.unresolved == ["ord-duplicate-id"]
+    assert f.service.get("ord-duplicate-id").status == Status.PENDING

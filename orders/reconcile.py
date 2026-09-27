@@ -39,12 +39,37 @@ def _reconcile_locked(service) -> Report:
     orders = repository.list_orders_for_reconciliation()
     report = Report(checked=len(orders))
 
+    try:
+        provider_charges = service.provider.list_charges("")
+        provider_refunds = service.provider.list_refunds("")
+    except paylink.PaylinkError:
+        report.unresolved.extend(order.order_no for order in orders)
+        return report
+    if not isinstance(provider_charges, list) or not isinstance(provider_refunds, list):
+        report.unresolved.extend(order.order_no for order in orders)
+        return report
+    if any(service._validate_charge_shape(charge) for charge in provider_charges):
+        report.unresolved.extend(order.order_no for order in orders)
+        return report
+    if any(service._validate_refund(refund) for refund in provider_refunds):
+        report.unresolved.extend(order.order_no for order in orders)
+        return report
+    charge_ids = [charge.id for charge in provider_charges]
+    refund_ids = [refund.id for refund in provider_refunds]
+    if len(charge_ids) != len(set(charge_ids)) or len(refund_ids) != len(set(refund_ids)):
+        report.unresolved.extend(order.order_no for order in orders)
+        return report
+    charge_id_set = set(charge_ids)
+    if any(refund.charge_id not in charge_id_set for refund in provider_refunds):
+        report.unresolved.extend(order.order_no for order in orders)
+        return report
+
     charges_by_reference: dict[str, list[paylink.Charge]] = defaultdict(list)
-    for charge in service.provider.list_charges(""):
+    for charge in provider_charges:
         charges_by_reference[charge.reference].append(charge)
 
     refunds_by_charge: dict[str, list[paylink.Refund]] = defaultdict(list)
-    for refund in service.provider.list_refunds(""):
+    for refund in provider_refunds:
         refunds_by_charge[refund.charge_id].append(refund)
 
     for order in orders:
@@ -62,10 +87,21 @@ def _reconcile_locked(service) -> Report:
         active: list[paylink.Charge] = []
         fully_refunded: list[paylink.Charge] = []
         ambiguous = False
-        for charge in successful:
+        for charge in provider_charges:
+            related_refunds = refunds_by_charge.get(charge.id, [])
+            if any(refund.created_at < charge.created_at for refund in related_refunds):
+                ambiguous = True
+                continue
+            if charge.status != "succeeded":
+                if any(refund.status != "failed" for refund in related_refunds):
+                    ambiguous = True
+                continue
+            if any(refund.status not in ("succeeded", "failed") for refund in related_refunds):
+                ambiguous = True
+                continue
             refunded = sum(
                 refund.amount
-                for refund in refunds_by_charge.get(charge.id, [])
+                for refund in related_refunds
                 if refund.status == "succeeded"
             )
             if refunded == 0:

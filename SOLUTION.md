@@ -112,13 +112,15 @@ responses, concurrent duplicate orders, concurrent and repeated refunds, safe du
 amount mismatch handling, cursor pagination, stable charge idempotency keys after a lost response,
 non-retryable ambiguous refund failures, refund recovery after a lost response, API versioning,
 missing refund identifiers, invalid charge/refund timestamps, invalid duplicate-refund responses,
-and `Retry-After` handling.
+duplicate identifiers across pages, malformed provider objects, unresolved refund states, orphaned
+refunds, and bounded `Retry-After` handling. The refund ledger is authoritative because the live
+sandbox leaves the charge-level `refunded_amount` stale after a successful refund.
 
 Commands run:
 
 ```text
 pytest -q
-28 passed
+33 passed
 
 python manage.py check
 System check identified no issues (0 silenced).
