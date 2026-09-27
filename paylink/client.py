@@ -184,7 +184,9 @@ class Client:
             if any(not isinstance(item, dict) for item in data):
                 raise PaylinkError("paylink: invalid list item")
             result.extend(data)
-            next_cursor = page.get("next_cursor") or ""
+            next_cursor = page.get("next_cursor")
+            if next_cursor is None:
+                next_cursor = ""
             if not isinstance(next_cursor, str):
                 raise PaylinkError("paylink: invalid next cursor")
             if not next_cursor:

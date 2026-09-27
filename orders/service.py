@@ -278,16 +278,24 @@ class Service:
                 raise Conflict()
             charge = candidates[0]
             provider_charge = self.provider.get_charge(charge.provider_charge_id)
-            if self._validate_charge(provider_charge, value) or provider_charge.status != "succeeded":
+            if (
+                self._validate_charge(provider_charge, value)
+                or provider_charge.id != charge.provider_charge_id
+                or provider_charge.status != "succeeded"
+            ):
                 raise Conflict()
 
             refunds = self.provider.list_refunds(charge.provider_charge_id)
             if not isinstance(refunds, list):
                 raise paylink.PaylinkError("paylink: invalid refund list")
+            refund_ids = set()
             for item in refunds:
                 error = self._validate_refund(item, charge.provider_charge_id)
                 if error:
                     raise paylink.PaylinkError(f"paylink: {error}")
+                if item.id in refund_ids or item.created_at < provider_charge.created_at:
+                    raise paylink.PaylinkError("paylink: contradictory refund history")
+                refund_ids.add(item.id)
                 if item.status not in ("succeeded", "failed"):
                     raise paylink.PaylinkError("paylink: unresolved refund status")
             refunded = sum(item.amount for item in refunds if item.status == "succeeded")

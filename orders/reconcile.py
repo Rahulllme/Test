@@ -84,6 +84,14 @@ def _reconcile_locked(service) -> Report:
             continue
 
         successful = [charge for charge in provider_charges if charge.status == "succeeded"]
+        # An unknown charge may still settle later. Do not repair duplicates or declare a
+        # final net balance while any such operation is outstanding.
+        statuses = {charge.status for charge in provider_charges}
+        if statuses - {"succeeded", "failed", "requires_action"} or (
+            successful and "requires_action" in statuses
+        ):
+            report.unresolved.append(order.order_no)
+            continue
         active: list[paylink.Charge] = []
         fully_refunded: list[paylink.Charge] = []
         ambiguous = False

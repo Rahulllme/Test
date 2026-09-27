@@ -166,3 +166,54 @@ def test_invalid_refund_identity_or_timestamp_becomes_paylink_error(body, error)
         client.create_refund("ch_1", 1000)
 
     assert len(client._session.calls) == 1
+
+
+@pytest.mark.parametrize("cursor", [False, 0, [], {}, 123])
+def test_invalid_cursor_cannot_hide_remaining_pages(cursor):
+    client = paylink.Client("https://paylink.test")
+    client._session = Session([Response(200, {"data": [], "next_cursor": cursor})])
+    with pytest.raises(paylink.PaylinkError, match="invalid next cursor"):
+        client.list_refunds("")
+
+
+def test_repeated_cursor_terminates_without_returning_partial_evidence():
+    client = paylink.Client("https://paylink.test")
+    client._session = Session([
+        Response(200, {"data": [], "next_cursor": "again"}),
+        Response(200, {"data": [], "next_cursor": "again"}),
+    ])
+    with pytest.raises(paylink.PaylinkError, match="repeated next cursor"):
+        client.list_charges("")
+    assert len(client._session.calls) == 2
+
+
+@pytest.mark.parametrize("field,value", [
+    ("id", None), ("id", "   "), ("id", 123),
+    ("amount", True), ("amount", "1000"), ("amount", 1000.5),
+    ("status", []), ("status", ""),
+    ("created_at", None), ("created_at", "2026-09-27T12:00:00"),
+    ("created_at", "2026-02-30T12:00:00Z"),
+])
+def test_invalid_refund_fields_never_trigger_a_second_post(field, value):
+    body = refund()
+    body[field] = value
+    client = paylink.Client("https://paylink.test")
+    client._session = Session([Response(201, body)])
+    with pytest.raises(paylink.PaylinkError):
+        client.create_refund("ch_1", 1000)
+    assert len(client._session.calls) == 1
+
+
+def test_missing_refund_id_is_rejected():
+    body = refund()
+    del body["id"]
+    with pytest.raises(paylink.PaylinkError, match="invalid id"):
+        paylink.Refund.from_json(body)
+
+
+def test_refund_server_failure_is_not_retried():
+    client = paylink.Client("https://paylink.test", sleep=lambda _: None)
+    client._session = Session([Response(503, {"error": "unavailable"})])
+    with pytest.raises(paylink.HTTPError):
+        client.create_refund("ch_1", 1000)
+    assert len(client._session.calls) == 1
