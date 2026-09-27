@@ -62,6 +62,13 @@ first reads the complete provider refund history: if the original refund succeed
 local state without moving money again; if no refund exists, it may make one new attempt. The
 idempotency header is still sent for forward compatibility but is not trusted as a safety control.
 
+Provider payloads cross a strict validation boundary before business logic can use them. Charge
+and refund identifiers must be non-empty strings, amounts must be integers (not booleans), statuses
+must be non-empty strings, and timestamps must be valid timezone-qualified date strings. Malformed
+payloads become `PaylinkError`; they can leave a charge pending or a reconciliation unresolved, but
+cannot manufacture evidence that money moved. A successful refund additionally requires a
+non-empty provider refund ID before the local order can become refunded.
+
 ### Reconciliation
 
 One run fetches complete charge and refund snapshots once, avoiding an all-pages scan per order
@@ -104,13 +111,14 @@ explicit non-retried legacy 402 decline, recoverable temporary failures, malform
 responses, concurrent duplicate orders, concurrent and repeated refunds, safe duplicate repair,
 amount mismatch handling, cursor pagination, stable charge idempotency keys after a lost response,
 non-retryable ambiguous refund failures, refund recovery after a lost response, API versioning,
+missing refund identifiers, invalid charge/refund timestamps, invalid duplicate-refund responses,
 and `Retry-After` handling.
 
 Commands run:
 
 ```text
 pytest -q
-23 passed
+28 passed
 
 python manage.py check
 System check identified no issues (0 silenced).

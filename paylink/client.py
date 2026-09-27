@@ -30,15 +30,15 @@ class Charge:
     @classmethod
     def from_json(cls, data: dict) -> "Charge":
         return cls(
-            id=data.get("id", ""),
-            reference=data.get("reference", ""),
-            amount=data.get("amount", 0),
-            currency=data.get("currency", ""),
-            status=data.get("status", ""),
-            card_token=data.get("card_token", ""),
-            refunded_amount=data.get("refunded_amount", 0),
-            created_at=parse_time(data.get("created_at")),
-            updated_at=parse_time(data.get("updated_at")),
+            id=_string_field(data, "id", required=True),
+            reference=_string_field(data, "reference", required=True),
+            amount=_integer_field(data, "amount"),
+            currency=_string_field(data, "currency", required=True),
+            status=_string_field(data, "status", required=True),
+            card_token=_string_field(data, "card_token"),
+            refunded_amount=_integer_field(data, "refunded_amount", default=0),
+            created_at=_time_field(data, "created_at"),
+            updated_at=_time_field(data, "updated_at"),
         )
 
 
@@ -53,11 +53,11 @@ class Refund:
     @classmethod
     def from_json(cls, data: dict) -> "Refund":
         return cls(
-            id=data.get("id", ""),
-            charge_id=data.get("charge_id", ""),
-            amount=data.get("amount", 0),
-            status=data.get("status", ""),
-            created_at=parse_time(data.get("created_at")),
+            id=_string_field(data, "id", required=True),
+            charge_id=_string_field(data, "charge_id", required=True),
+            amount=_integer_field(data, "amount"),
+            status=_string_field(data, "status", required=True),
+            created_at=_time_field(data, "created_at"),
         )
 
 
@@ -79,6 +79,39 @@ class HTTPError(PaylinkError):
         super().__init__(f"paylink: http {status} ({code})")
         self.status = status
         self.code = code
+
+
+def _string_field(data: dict, name: str, required: bool = False) -> str:
+    if not isinstance(data, dict):
+        raise PaylinkError("paylink: invalid response shape")
+    value = data.get(name, "")
+    if not isinstance(value, str) or (required and not value.strip()):
+        raise PaylinkError(f"paylink: invalid {name}")
+    return value
+
+
+def _integer_field(data: dict, name: str, default=None) -> int:
+    if not isinstance(data, dict):
+        raise PaylinkError("paylink: invalid response shape")
+    value = data.get(name, default)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise PaylinkError(f"paylink: invalid {name}")
+    return value
+
+
+def _time_field(data: dict, name: str) -> datetime:
+    if not isinstance(data, dict):
+        raise PaylinkError("paylink: invalid response shape")
+    value = data.get(name)
+    if not isinstance(value, str) or not value:
+        raise PaylinkError(f"paylink: invalid {name}")
+    try:
+        parsed = parse_time(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise PaylinkError(f"paylink: invalid {name}") from exc
+    if parsed is None:
+        raise PaylinkError(f"paylink: invalid {name}")
+    return parsed
 
 
 class Client:
@@ -231,6 +264,11 @@ _FRACTION = re.compile(r"\.(\d+)")
 def parse_time(value: str | None) -> datetime | None:
     if not value:
         return None
+    if not isinstance(value, str):
+        raise TypeError("timestamp must be a string")
     # Python keeps microseconds; longer fractions are cut to six digits.
     value = _FRACTION.sub(lambda m: "." + m.group(1)[:6].ljust(6, "0"), value, count=1)
-    return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        raise ValueError("timestamp must include a timezone")
+    return parsed.astimezone(timezone.utc)

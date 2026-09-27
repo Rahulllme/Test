@@ -54,13 +54,7 @@ def _reconcile_locked(service) -> Report:
             continue
 
         # A reused reference with a different amount cannot safely be assigned to this order.
-        if any(
-            not charge.id
-            or charge.reference != order.order_no
-            or charge.amount != order.amount_jpy
-            or charge.currency != "JPY"
-            for charge in provider_charges
-        ):
+        if any(service._validate_charge(charge, order) for charge in provider_charges):
             report.unresolved.append(order.order_no)
             continue
 
@@ -91,12 +85,11 @@ def _reconcile_locked(service) -> Report:
             try:
                 for duplicate in extras:
                     refund = service.provider.create_refund(duplicate.id, duplicate.amount)
-                    if (
-                        refund.charge_id != duplicate.id
-                        or refund.amount != duplicate.amount
-                        or refund.status != "succeeded"
-                    ):
-                        raise paylink.PaylinkError("paylink: invalid duplicate-refund response")
+                    error = service._validate_refund(refund, duplicate.id, duplicate.amount)
+                    if error or refund.status != "succeeded":
+                        raise paylink.PaylinkError(
+                            f"paylink: {error or 'duplicate refund did not succeed'}"
+                        )
                     refunds_by_charge[duplicate.id].append(refund)
                     fully_refunded.append(duplicate)
                 active = [canonical]

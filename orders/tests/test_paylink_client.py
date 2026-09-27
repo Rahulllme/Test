@@ -34,6 +34,18 @@ def charge(charge_id, reference):
         "amount": 1000,
         "currency": "JPY",
         "status": "succeeded",
+        "created_at": "2026-09-27T12:00:00Z",
+        "updated_at": "2026-09-27T12:00:00Z",
+    }
+
+
+def refund(refund_id="rf_1", created_at="2026-09-27T12:00:00Z"):
+    return {
+        "id": refund_id,
+        "charge_id": "ch_1",
+        "amount": 1000,
+        "status": "succeeded",
+        "created_at": created_at,
     }
 
 
@@ -100,3 +112,30 @@ def test_malformed_list_evidence_is_rejected_instead_of_silently_dropped():
 
     with pytest.raises(paylink.PaylinkError):
         client.list_charges("")
+
+
+def test_invalid_charge_timestamp_becomes_paylink_error():
+    body = charge("ch_1", "ord-1")
+    body["created_at"] = 123
+    client = paylink.Client("https://paylink.test", sleep=lambda _: None)
+    client._session = Session([Response(201, body)])
+
+    with pytest.raises(paylink.PaylinkError, match="created_at"):
+        client.create_charge("ord-1", 1000, "tok_visa")
+
+
+@pytest.mark.parametrize(
+    "body,error",
+    [
+        (refund(refund_id=""), "invalid id"),
+        (refund(created_at="not-a-date"), "invalid created_at"),
+    ],
+)
+def test_invalid_refund_identity_or_timestamp_becomes_paylink_error(body, error):
+    client = paylink.Client("https://paylink.test", sleep=lambda _: None)
+    client._session = Session([Response(201, body)])
+
+    with pytest.raises(paylink.PaylinkError, match=error):
+        client.create_refund("ch_1", 1000)
+
+    assert len(client._session.calls) == 1

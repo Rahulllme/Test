@@ -256,6 +256,25 @@ def test_refund_retry_does_not_issue_a_second_refund(f):
     assert len(f.provider.list_refunds("")) == 1
 
 
+def test_refund_response_without_provider_id_does_not_mark_order_refunded(f):
+    assert f.post("/orders", place_order("ord-refund-no-id", "noid@example.com", 6125, "tok_visa")).status_code == 201
+
+    def missing_id(charge_id, amount):
+        return paylink.Refund(
+            id="",
+            charge_id=charge_id,
+            amount=amount,
+            status="succeeded",
+            created_at=f.clock.now(),
+        )
+
+    f.provider.create_refund = missing_id
+    response = f.post("/orders/ord-refund-no-id/refund")
+
+    assert response.status_code == 500
+    assert f.service.get("ord-refund-no-id").status == Status.PAID
+
+
 def test_concurrent_refund_requests_issue_one_provider_refund(f):
     assert f.post("/orders", place_order("ord-refund-concurrent", "rc@example.com", 6150, "tok_visa")).status_code == 201
     barrier = threading.Barrier(2)
@@ -331,6 +350,27 @@ def test_reconcile_refunds_a_conclusive_duplicate_and_keeps_one_charge(f):
     assert f.service.get("ord-duplicate").status == Status.PAID
     rows = f.service.charges("ord-duplicate")
     assert sorted(row.status for row in rows) == [ChargeStatus.REFUNDED, ChargeStatus.SUCCEEDED]
+
+
+def test_reconcile_rejects_duplicate_refund_response_without_provider_id(f):
+    assert f.post("/orders", place_order("ord-duplicate-no-refund-id", "dni@example.com", 7150, "tok_visa")).status_code == 201
+    f.provider.create_charge("ord-duplicate-no-refund-id", 7150, "tok_visa")
+
+    def missing_id(charge_id, amount):
+        return paylink.Refund(
+            id="",
+            charge_id=charge_id,
+            amount=amount,
+            status="succeeded",
+            created_at=f.clock.now(),
+        )
+
+    f.provider.create_refund = missing_id
+    report = f.service.reconcile()
+
+    assert report.unresolved == ["ord-duplicate-no-refund-id"]
+    assert f.service.get("ord-duplicate-no-refund-id").status == Status.PAID
+    assert f.provider.list_refunds("") == []
 
 
 def test_reconcile_recovers_a_duplicate_refund_after_its_response_is_lost(f):
