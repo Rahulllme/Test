@@ -30,7 +30,8 @@ class PlaceOrderInput:
     card_token: str = ""
 
 
-# How often the provider call is retried on a transport error.
+# How often the provider call is retried when it produced no definitive result.  The Paylink
+# client sends a stable idempotency key, so repeating one logical charge cannot move money twice.
 CHARGE_ATTEMPTS = 3
 
 
@@ -40,13 +41,12 @@ class Service:
         self.clock = clock
 
     def place_order(self, input: PlaceOrderInput) -> Order:
-        """Stores the order and charges the card as one unit of work, so an order is never stored
-        without the charge that belongs to it."""
+        """Persist the intent before contacting Paylink, then record its definitive result."""
         if not input.order_no or not input.customer_email or input.amount_jpy <= 0 or not input.card_token:
             raise InvalidRequest()
-        with transaction.atomic():
-            now = self.clock.now()
-            try:
+        try:
+            with transaction.atomic():
+                now = self.clock.now()
                 stored = repository.insert_order(
                     Order(
                         order_no=input.order_no,
@@ -57,48 +57,123 @@ class Service:
                         updated_at=now,
                     )
                 )
-            except IntegrityError as exc:
-                if "orders_order_no_key" in str(exc):
-                    raise Conflict() from exc
-                raise
-
-            last_error = None
-            for attempt in range(1, CHARGE_ATTEMPTS + 1):
-                try:
-                    charge = self.provider.create_charge(stored.order_no, stored.amount_jpy, input.card_token)
-                except paylink.PaylinkError as exc:
-                    last_error = exc
-                    continue
-                # The provider answered 2xx, so the charge went through.
-                repository.insert_charge(
-                    Charge(
-                        order_id=stored.id,
-                        provider_charge_id=charge.id,
-                        amount_jpy=stored.amount_jpy,
-                        status=ChargeStatus.SUCCEEDED,
-                        attempts=attempt,
-                        created_at=now,
-                        updated_at=self.clock.now(),
-                    )
-                )
-                repository.set_order_status(stored.id, Status.PAID, self.clock.now())
-                stored.status = Status.PAID
-                return stored
-
-            repository.insert_charge(
-                Charge(
+                charge_row = Charge(
                     order_id=stored.id,
                     amount_jpy=stored.amount_jpy,
-                    status=ChargeStatus.FAILED,
-                    attempts=CHARGE_ATTEMPTS,
-                    last_error=str(last_error),
+                    status=ChargeStatus.UNKNOWN,
+                    attempts=0,
                     created_at=now,
-                    updated_at=self.clock.now(),
+                    updated_at=now,
                 )
+                repository.insert_charge(charge_row)
+        except IntegrityError as exc:
+            # The order number is the public idempotency boundary of this API.  Do not contact
+            # Paylink after another request has already claimed it.
+            try:
+                repository.find_order(input.order_no)
+            except Order.DoesNotExist:
+                raise
+            raise Conflict() from exc
+
+        last_error = ""
+        for attempt in range(1, CHARGE_ATTEMPTS + 1):
+            try:
+                provider_charge = self.provider.create_charge(
+                    stored.order_no, stored.amount_jpy, input.card_token
+                )
+            except paylink.HTTPError as exc:
+                last_error = str(exc)
+                repository.update_charge(
+                    charge_row.id, "", ChargeStatus.UNKNOWN, attempt, last_error, self.clock.now()
+                )
+                if exc.status == 409:
+                    # An idempotency conflict can mean Paylink already has a result for this key.
+                    # It is not evidence that no charge exists, so reconciliation must decide.
+                    self._finish_charge(
+                        stored, charge_row, "", ChargeStatus.UNKNOWN, attempt, last_error
+                    )
+                    return stored
+                if 400 <= exc.status < 500 and exc.status not in (408, 429):
+                    self._finish_charge(stored, charge_row, "", ChargeStatus.FAILED, attempt, last_error)
+                    return stored
+                continue
+            except paylink.PaylinkError as exc:
+                last_error = str(exc)
+                repository.update_charge(
+                    charge_row.id, "", ChargeStatus.UNKNOWN, attempt, last_error, self.clock.now()
+                )
+                continue
+
+            error = self._validate_charge(provider_charge, stored)
+            if error:
+                self._finish_charge(
+                    stored, charge_row, provider_charge.id, ChargeStatus.UNKNOWN, attempt, error
+                )
+                return stored
+            if provider_charge.status == "succeeded":
+                self._finish_charge(
+                    stored, charge_row, provider_charge.id, ChargeStatus.SUCCEEDED, attempt, ""
+                )
+                return stored
+            if provider_charge.status == "failed":
+                self._finish_charge(
+                    stored,
+                    charge_row,
+                    provider_charge.id,
+                    ChargeStatus.FAILED,
+                    attempt,
+                    "provider status: failed",
+                )
+                return stored
+
+            # ``requires_action`` and future statuses are not successful charges.  They also are
+            # not safe to call failures: Paylink may still transition them later.
+            self._finish_charge(
+                stored,
+                charge_row,
+                provider_charge.id,
+                ChargeStatus.UNKNOWN,
+                attempt,
+                f"provider status: {provider_charge.status or 'missing'}",
             )
-            repository.set_order_status(stored.id, Status.FAILED, self.clock.now())
-            stored.status = Status.FAILED
             return stored
+
+        # A timeout is not proof of failure.  Reconciliation can discover the provider record.
+        stored.status = Status.PENDING
+        stored.updated_at = self.clock.now()
+        return stored
+
+    def _validate_charge(self, charge: paylink.Charge, order: Order) -> str:
+        if not charge.id:
+            return "provider returned a charge without an id"
+        if charge.reference != order.order_no:
+            return "provider returned a mismatched reference"
+        if charge.amount != order.amount_jpy or charge.currency != "JPY":
+            return "provider returned a mismatched amount or currency"
+        return ""
+
+    def _finish_charge(
+        self,
+        order: Order,
+        charge_row: Charge,
+        provider_charge_id: str,
+        charge_status: str,
+        attempts: int,
+        error: str,
+    ) -> None:
+        order_status = Status.PENDING
+        if charge_status == ChargeStatus.SUCCEEDED:
+            order_status = Status.PAID
+        elif charge_status == ChargeStatus.FAILED:
+            order_status = Status.FAILED
+        with transaction.atomic():
+            now = self.clock.now()
+            repository.update_charge(
+                charge_row.id, provider_charge_id, charge_status, attempts, error, now
+            )
+            repository.set_order_status(order.id, order_status, now)
+        order.status = order_status
+        order.updated_at = now
 
     def get(self, order_no: str) -> Order:
         try:
@@ -121,11 +196,38 @@ class Service:
                 value = repository.find_order_for_update(order_no)
             except Order.DoesNotExist as exc:
                 raise NotFound() from exc
+            if value.status == Status.REFUNDED:
+                return value
+            if value.status != Status.PAID:
+                raise Conflict()
             charges = repository.list_charges(value.id)
-            if not charges:
-                raise NotFound()
-            charge = charges[-1]
-            self.provider.create_refund(charge.provider_charge_id, value.amount_jpy)
+            candidates = [
+                charge
+                for charge in charges
+                if charge.status == ChargeStatus.SUCCEEDED
+                and charge.provider_charge_id
+                and charge.amount_jpy == value.amount_jpy
+            ]
+            provider_ids = {charge.provider_charge_id for charge in candidates}
+            if len(provider_ids) != 1:
+                raise Conflict()
+            charge = candidates[0]
+            provider_charge = self.provider.get_charge(charge.provider_charge_id)
+            if self._validate_charge(provider_charge, value) or provider_charge.status != "succeeded":
+                raise Conflict()
+
+            refunds = self.provider.list_refunds(charge.provider_charge_id)
+            refunded = sum(item.amount for item in refunds if item.status == "succeeded")
+            if refunded not in (0, value.amount_jpy):
+                raise Conflict()
+            if refunded == 0:
+                refund = self.provider.create_refund(charge.provider_charge_id, value.amount_jpy)
+                if (
+                    refund.charge_id != charge.provider_charge_id
+                    or refund.amount != value.amount_jpy
+                    or refund.status != "succeeded"
+                ):
+                    raise paylink.PaylinkError("paylink: invalid refund response")
             now = self.clock.now()
             repository.update_charge(
                 charge.id, charge.provider_charge_id, ChargeStatus.REFUNDED, charge.attempts, "", now

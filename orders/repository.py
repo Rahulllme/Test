@@ -26,6 +26,11 @@ def list_orders_by_status(status: str) -> list[Order]:
     return list(Order.objects.filter(status=status).order_by("created_at", "id"))
 
 
+def list_orders_for_reconciliation() -> list[Order]:
+    """Lock the reconciliation set so refunds and other reconciliation runs cannot overlap."""
+    return list(Order.objects.select_for_update().order_by("created_at", "id"))
+
+
 def set_order_status(order_id: int, status: str, now: datetime) -> None:
     Order.objects.filter(id=order_id).update(status=status, updated_at=now)
 
