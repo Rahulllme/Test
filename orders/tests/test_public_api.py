@@ -1,16 +1,19 @@
 import json
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from django.db import close_old_connections
 from django.test import Client
 
 import paylink
 from orders.clock import ManualClock
 from orders.container import set_service
+from orders.errors import Conflict
 from orders.models import ChargeStatus, Status
-from orders.service import Service
+from orders.service import PlaceOrderInput, Service
 
 
 class FakeProvider:
@@ -142,6 +145,23 @@ def test_declined_card_leaves_the_order_unpaid(f):
     assert charge.status == ChargeStatus.FAILED and charge.provider_charge_id
 
 
+def test_legacy_402_decline_is_definitive_and_not_retried(f):
+    calls = 0
+
+    def decline(reference, amount, card_token):
+        nonlocal calls
+        calls += 1
+        raise paylink.HTTPError(402, "card_declined")
+
+    f.provider.create_charge = decline
+    w = f.post("/orders", place_order("ord-402", "declined@example.com", 3200, "tok_visa"))
+
+    assert w.status_code == 201, w.content
+    assert w.json()["status"] == Status.FAILED
+    assert calls == 1
+    assert f.service.charges("ord-402")[0].attempts == 1
+
+
 def test_3ds_charge_remains_pending(f):
     w = f.post("/orders", place_order("ord-3ds", "3ds@example.com", 3100, "tok_3ds"))
     assert w.status_code == 201, w.content
@@ -163,6 +183,46 @@ def test_transport_failure_remains_pending_for_reconciliation(f):
     charge = f.service.charges("ord-timeout")[0]
     assert charge.status == ChargeStatus.UNKNOWN
     assert charge.attempts == 3
+
+
+def test_temporary_provider_failure_is_retried_and_can_recover(f):
+    create_charge = f.provider.create_charge
+    calls = 0
+
+    def temporarily_unavailable(reference, amount, card_token):
+        nonlocal calls
+        calls += 1
+        if calls < 3:
+            raise paylink.HTTPError(503, "temporarily_unavailable")
+        return create_charge(reference, amount, card_token)
+
+    f.provider.create_charge = temporarily_unavailable
+    w = f.post("/orders", place_order("ord-temporary", "temp@example.com", 4150, "tok_visa"))
+
+    assert w.status_code == 201, w.content
+    assert w.json()["status"] == Status.PAID
+    assert calls == 3
+    assert f.service.charges("ord-temporary")[0].attempts == 3
+
+
+def test_malformed_success_response_does_not_mark_order_paid(f):
+    def malformed(reference, amount, card_token):
+        return paylink.Charge(
+            id="ch_wrong",
+            reference=reference,
+            amount=amount + 1,
+            currency="JPY",
+            status="succeeded",
+        )
+
+    f.provider.create_charge = malformed
+    w = f.post("/orders", place_order("ord-malformed", "bad@example.com", 4175, "tok_visa"))
+
+    assert w.status_code == 201, w.content
+    assert w.json()["status"] == Status.PENDING
+    charge = f.service.charges("ord-malformed")[0]
+    assert charge.status == ChargeStatus.UNKNOWN
+    assert "mismatched amount" in charge.last_error
 
 
 def test_idempotency_conflict_is_not_misclassified_as_a_failed_charge(f):
@@ -194,6 +254,47 @@ def test_refund_retry_does_not_issue_a_second_refund(f):
     assert f.post("/orders/ord-refund-once/refund").status_code == 200
     assert f.post("/orders/ord-refund-once/refund").status_code == 200
     assert len(f.provider.list_refunds("")) == 1
+
+
+def test_concurrent_refund_requests_issue_one_provider_refund(f):
+    assert f.post("/orders", place_order("ord-refund-concurrent", "rc@example.com", 6150, "tok_visa")).status_code == 201
+    barrier = threading.Barrier(2)
+
+    def refund():
+        close_old_connections()
+        try:
+            barrier.wait()
+            return f.service.refund("ord-refund-concurrent").status
+        finally:
+            close_old_connections()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        statuses = list(pool.map(lambda _: refund(), range(2)))
+
+    assert statuses == [Status.REFUNDED, Status.REFUNDED]
+    assert len(f.provider.list_refunds("")) == 1
+
+
+def test_concurrent_duplicate_order_requests_charge_once(f):
+    barrier = threading.Barrier(2)
+    value = PlaceOrderInput("ord-concurrent", "same@example.com", 6175, "tok_visa")
+
+    def place():
+        close_old_connections()
+        try:
+            barrier.wait()
+            try:
+                return f.service.place_order(value).status
+            except Conflict:
+                return "conflict"
+        finally:
+            close_old_connections()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _: place(), range(2)))
+
+    assert sorted(results) == ["conflict", Status.PAID]
+    assert len(f.provider.list_charges("ord-concurrent")) == 1
 
 
 def test_refund_recovers_after_provider_succeeds_but_response_is_lost(f):
