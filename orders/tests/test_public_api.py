@@ -14,8 +14,7 @@ from orders.service import Service
 
 
 class FakeProvider:
-    """Stands in for Paylink in tests. It behaves the way docs/paylink-api.md describes the
-    provider."""
+    """Stands in for the current Paylink behavior observed in the supplied sandbox."""
 
     def __init__(self):
         self._lock = threading.Lock()
@@ -25,16 +24,19 @@ class FakeProvider:
 
     def create_charge(self, reference, amount, card_token):
         with self._lock:
-            if card_token == "tok_insufficient":
-                raise paylink.HTTPError(402, "card_declined")
             self.sequence += 1
             now = datetime.now(timezone.utc)
+            status = "succeeded"
+            if card_token == "tok_insufficient":
+                status = "failed"
+            elif card_token == "tok_3ds":
+                status = "requires_action"
             charge = paylink.Charge(
                 id=f"ch_{self.sequence:024d}",
                 reference=reference,
                 amount=amount,
                 currency="JPY",
-                status="succeeded",
+                status=status,
                 card_token=card_token,
                 created_at=now,
                 updated_at=now,
@@ -135,7 +137,46 @@ def test_declined_card_leaves_the_order_unpaid(f):
     w = f.post("/orders", place_order("ord-3004", "d@example.com", 3000, "tok_insufficient"))
     assert w.status_code == 201, w.content
     value = f.service.get("ord-3004")
-    assert value.status != Status.PAID, f"declined card produced a paid order: {value.status}"
+    assert value.status == Status.FAILED, f"declined card produced the wrong state: {value.status}"
+    charge = f.service.charges("ord-3004")[0]
+    assert charge.status == ChargeStatus.FAILED and charge.provider_charge_id
+
+
+def test_3ds_charge_remains_pending(f):
+    w = f.post("/orders", place_order("ord-3ds", "3ds@example.com", 3100, "tok_3ds"))
+    assert w.status_code == 201, w.content
+    assert w.json()["status"] == Status.PENDING
+    charge = f.service.charges("ord-3ds")[0]
+    assert charge.status == ChargeStatus.UNKNOWN
+    assert "requires_action" in charge.last_error
+
+
+def test_transport_failure_remains_pending_for_reconciliation(f):
+    def unavailable(reference, amount, card_token):
+        raise paylink.PaylinkError("connection lost")
+
+    f.provider.create_charge = unavailable
+    w = f.post("/orders", place_order("ord-timeout", "t@example.com", 4100, "tok_visa"))
+
+    assert w.status_code == 201, w.content
+    assert w.json()["status"] == Status.PENDING
+    charge = f.service.charges("ord-timeout")[0]
+    assert charge.status == ChargeStatus.UNKNOWN
+    assert charge.attempts == 3
+
+
+def test_idempotency_conflict_is_not_misclassified_as_a_failed_charge(f):
+    def conflict(reference, amount, card_token):
+        raise paylink.HTTPError(409, "idempotency_conflict")
+
+    f.provider.create_charge = conflict
+    w = f.post("/orders", place_order("ord-idem-conflict", "i@example.com", 4200, "tok_visa"))
+
+    assert w.status_code == 201, w.content
+    assert w.json()["status"] == Status.PENDING
+    charge = f.service.charges("ord-idem-conflict")[0]
+    assert charge.status == ChargeStatus.UNKNOWN
+    assert charge.attempts == 1
 
 
 def test_refund_marks_the_order_refunded(f):
@@ -146,3 +187,83 @@ def test_refund_marks_the_order_refunded(f):
     assert f.service.get("ord-3005").status == Status.REFUNDED
     refunds = f.provider.list_refunds("")
     assert len(refunds) == 1, refunds
+
+
+def test_refund_retry_does_not_issue_a_second_refund(f):
+    assert f.post("/orders", place_order("ord-refund-once", "r@example.com", 6100, "tok_visa")).status_code == 201
+    assert f.post("/orders/ord-refund-once/refund").status_code == 200
+    assert f.post("/orders/ord-refund-once/refund").status_code == 200
+    assert len(f.provider.list_refunds("")) == 1
+
+
+def test_refund_recovers_after_provider_succeeds_but_response_is_lost(f):
+    assert f.post("/orders", place_order("ord-refund-lost", "lost@example.com", 6200, "tok_visa")).status_code == 201
+    create_refund = f.provider.create_refund
+    lost = True
+
+    def lose_first_response(charge_id, amount):
+        nonlocal lost
+        refund = create_refund(charge_id, amount)
+        if lost:
+            lost = False
+            raise paylink.PaylinkError("response lost")
+        return refund
+
+    f.provider.create_refund = lose_first_response
+    assert f.post("/orders/ord-refund-lost/refund").status_code == 500
+    assert f.service.get("ord-refund-lost").status == Status.PAID
+    assert len(f.provider.list_refunds("")) == 1
+
+    assert f.post("/orders/ord-refund-lost/refund").status_code == 200
+    assert f.service.get("ord-refund-lost").status == Status.REFUNDED
+    assert len(f.provider.list_refunds("")) == 1
+
+
+def test_reconcile_refunds_a_conclusive_duplicate_and_keeps_one_charge(f):
+    assert f.post("/orders", place_order("ord-duplicate", "d@example.com", 7100, "tok_visa")).status_code == 201
+    duplicate = f.provider.create_charge("ord-duplicate", 7100, "tok_visa")
+
+    report = f.service.reconcile()
+
+    assert report.settled == ["ord-duplicate"]
+    assert len(f.provider.list_refunds(duplicate.id)) == 1
+    assert f.service.get("ord-duplicate").status == Status.PAID
+    rows = f.service.charges("ord-duplicate")
+    assert sorted(row.status for row in rows) == [ChargeStatus.REFUNDED, ChargeStatus.SUCCEEDED]
+
+
+def test_reconcile_recovers_a_duplicate_refund_after_its_response_is_lost(f):
+    assert f.post("/orders", place_order("ord-duplicate-lost", "dl@example.com", 7200, "tok_visa")).status_code == 201
+    duplicate = f.provider.create_charge("ord-duplicate-lost", 7200, "tok_visa")
+    create_refund = f.provider.create_refund
+    lost = True
+
+    def lose_first_response(charge_id, amount):
+        nonlocal lost
+        refund = create_refund(charge_id, amount)
+        if lost:
+            lost = False
+            raise paylink.PaylinkError("response lost")
+        return refund
+
+    f.provider.create_refund = lose_first_response
+    first = f.service.reconcile()
+    assert first.unresolved == ["ord-duplicate-lost"]
+    assert len(f.provider.list_refunds(duplicate.id)) == 1
+
+    second = f.service.reconcile()
+    assert second.unresolved == []
+    assert len(f.provider.list_refunds(duplicate.id)) == 1
+    rows = f.service.charges("ord-duplicate-lost")
+    assert sorted(row.status for row in rows) == [ChargeStatus.REFUNDED, ChargeStatus.SUCCEEDED]
+
+
+def test_reconcile_does_not_settle_a_mismatched_amount(f):
+    assert f.post("/orders", place_order("ord-mismatch", "m@example.com", 8100, "tok_3ds")).status_code == 201
+    f.provider.charges[0].amount = 8000
+
+    report = f.service.reconcile()
+
+    assert report.settled == []
+    assert report.unresolved == ["ord-mismatch"]
+    assert f.service.get("ord-mismatch").status == Status.PENDING
