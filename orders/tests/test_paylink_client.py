@@ -34,6 +34,18 @@ def charge(charge_id, reference):
         "amount": 1000,
         "currency": "JPY",
         "status": "succeeded",
+        "created_at": "2026-09-27T12:00:00Z",
+        "updated_at": "2026-09-27T12:00:00Z",
+    }
+
+
+def refund(refund_id="rf_1", created_at="2026-09-27T12:00:00Z"):
+    return {
+        "id": refund_id,
+        "charge_id": "ch_1",
+        "amount": 1000,
+        "status": "succeeded",
+        "created_at": created_at,
     }
 
 
@@ -94,9 +106,114 @@ def test_rate_limit_honors_retry_after():
     assert slept == [2.0]
 
 
+def test_non_finite_retry_after_uses_a_bounded_default():
+    slept = []
+    client = paylink.Client("https://paylink.test", sleep=slept.append)
+    client._session = Session(
+        [
+            Response(429, {"error": "rate_limited"}, {"Retry-After": "nan"}),
+            Response(200, {"data": []}),
+        ]
+    )
+
+    assert client.list_charges("") == []
+    assert slept == [1.0]
+
+
+def test_duplicate_ids_across_pages_make_the_snapshot_unusable():
+    client = paylink.Client("https://paylink.test", sleep=lambda _: None)
+    client._session = Session(
+        [
+            Response(200, {"data": [charge("ch_same", "one")], "next_cursor": "next"}),
+            Response(200, {"data": [charge("ch_same", "two")]}),
+        ]
+    )
+
+    with pytest.raises(paylink.PaylinkError, match="duplicate charge id"):
+        client.list_charges("")
+
+
 def test_malformed_list_evidence_is_rejected_instead_of_silently_dropped():
     client = paylink.Client("https://paylink.test", sleep=lambda _: None)
     client._session = Session([Response(200, {"data": ["not-a-charge"]})])
 
     with pytest.raises(paylink.PaylinkError):
         client.list_charges("")
+
+
+def test_invalid_charge_timestamp_becomes_paylink_error():
+    body = charge("ch_1", "ord-1")
+    body["created_at"] = 123
+    client = paylink.Client("https://paylink.test", sleep=lambda _: None)
+    client._session = Session([Response(201, body)])
+
+    with pytest.raises(paylink.PaylinkError, match="created_at"):
+        client.create_charge("ord-1", 1000, "tok_visa")
+
+
+@pytest.mark.parametrize(
+    "body,error",
+    [
+        (refund(refund_id=""), "invalid id"),
+        (refund(created_at="not-a-date"), "invalid created_at"),
+    ],
+)
+def test_invalid_refund_identity_or_timestamp_becomes_paylink_error(body, error):
+    client = paylink.Client("https://paylink.test", sleep=lambda _: None)
+    client._session = Session([Response(201, body)])
+
+    with pytest.raises(paylink.PaylinkError, match=error):
+        client.create_refund("ch_1", 1000)
+
+    assert len(client._session.calls) == 1
+
+
+@pytest.mark.parametrize("cursor", [False, 0, [], {}, 123])
+def test_invalid_cursor_cannot_hide_remaining_pages(cursor):
+    client = paylink.Client("https://paylink.test")
+    client._session = Session([Response(200, {"data": [], "next_cursor": cursor})])
+    with pytest.raises(paylink.PaylinkError, match="invalid next cursor"):
+        client.list_refunds("")
+
+
+def test_repeated_cursor_terminates_without_returning_partial_evidence():
+    client = paylink.Client("https://paylink.test")
+    client._session = Session([
+        Response(200, {"data": [], "next_cursor": "again"}),
+        Response(200, {"data": [], "next_cursor": "again"}),
+    ])
+    with pytest.raises(paylink.PaylinkError, match="repeated next cursor"):
+        client.list_charges("")
+    assert len(client._session.calls) == 2
+
+
+@pytest.mark.parametrize("field,value", [
+    ("id", None), ("id", "   "), ("id", 123),
+    ("amount", True), ("amount", "1000"), ("amount", 1000.5),
+    ("status", []), ("status", ""),
+    ("created_at", None), ("created_at", "2026-09-27T12:00:00"),
+    ("created_at", "2026-02-30T12:00:00Z"),
+])
+def test_invalid_refund_fields_never_trigger_a_second_post(field, value):
+    body = refund()
+    body[field] = value
+    client = paylink.Client("https://paylink.test")
+    client._session = Session([Response(201, body)])
+    with pytest.raises(paylink.PaylinkError):
+        client.create_refund("ch_1", 1000)
+    assert len(client._session.calls) == 1
+
+
+def test_missing_refund_id_is_rejected():
+    body = refund()
+    del body["id"]
+    with pytest.raises(paylink.PaylinkError, match="invalid id"):
+        paylink.Refund.from_json(body)
+
+
+def test_refund_server_failure_is_not_retried():
+    client = paylink.Client("https://paylink.test", sleep=lambda _: None)
+    client._session = Session([Response(503, {"error": "unavailable"})])
+    with pytest.raises(paylink.HTTPError):
+        client.create_refund("ch_1", 1000)
+    assert len(client._session.calls) == 1

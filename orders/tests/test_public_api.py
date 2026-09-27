@@ -1,7 +1,7 @@
 import json
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -207,12 +207,15 @@ def test_temporary_provider_failure_is_retried_and_can_recover(f):
 
 def test_malformed_success_response_does_not_mark_order_paid(f):
     def malformed(reference, amount, card_token):
+        now = f.clock.now()
         return paylink.Charge(
             id="ch_wrong",
             reference=reference,
             amount=amount + 1,
             currency="JPY",
             status="succeeded",
+            created_at=now,
+            updated_at=now,
         )
 
     f.provider.create_charge = malformed
@@ -239,6 +242,21 @@ def test_idempotency_conflict_is_not_misclassified_as_a_failed_charge(f):
     assert charge.attempts == 1
 
 
+def test_malformed_charge_object_is_recorded_as_unknown_without_crashing(f):
+    f.provider.create_charge = lambda reference, amount, card_token: {"status": "succeeded"}
+
+    response = f.post(
+        "/orders", place_order("ord-invalid-object", "shape@example.com", 4250, "tok_visa")
+    )
+
+    assert response.status_code == 201, response.content
+    assert response.json()["status"] == Status.PENDING
+    charge = f.service.charges("ord-invalid-object")[0]
+    assert charge.provider_charge_id == ""
+    assert charge.status == ChargeStatus.UNKNOWN
+    assert "invalid charge object" in charge.last_error
+
+
 def test_refund_marks_the_order_refunded(f):
     assert f.post("/orders", place_order("ord-3005", "e@example.com", 6000, "tok_visa")).status_code == 201
     f.clock.set(f.clock.now() + timedelta(hours=1))
@@ -254,6 +272,45 @@ def test_refund_retry_does_not_issue_a_second_refund(f):
     assert f.post("/orders/ord-refund-once/refund").status_code == 200
     assert f.post("/orders/ord-refund-once/refund").status_code == 200
     assert len(f.provider.list_refunds("")) == 1
+
+
+def test_refund_stops_when_provider_history_contains_an_unresolved_result(f):
+    assert f.post("/orders", place_order("ord-refund-unknown", "u@example.com", 6110, "tok_visa")).status_code == 201
+    charge_id = f.service.charges("ord-refund-unknown")[0].provider_charge_id
+    f.provider.refunds.append(
+        paylink.Refund(
+            id="rf_unresolved",
+            charge_id=charge_id,
+            amount=6110,
+            status="pending",
+            created_at=f.clock.now(),
+        )
+    )
+
+    response = f.post("/orders/ord-refund-unknown/refund")
+
+    assert response.status_code == 500
+    assert f.service.get("ord-refund-unknown").status == Status.PAID
+    assert len(f.provider.refunds) == 1
+
+
+def test_refund_response_without_provider_id_does_not_mark_order_refunded(f):
+    assert f.post("/orders", place_order("ord-refund-no-id", "noid@example.com", 6125, "tok_visa")).status_code == 201
+
+    def missing_id(charge_id, amount):
+        return paylink.Refund(
+            id="",
+            charge_id=charge_id,
+            amount=amount,
+            status="succeeded",
+            created_at=f.clock.now(),
+        )
+
+    f.provider.create_refund = missing_id
+    response = f.post("/orders/ord-refund-no-id/refund")
+
+    assert response.status_code == 500
+    assert f.service.get("ord-refund-no-id").status == Status.PAID
 
 
 def test_concurrent_refund_requests_issue_one_provider_refund(f):
@@ -333,6 +390,27 @@ def test_reconcile_refunds_a_conclusive_duplicate_and_keeps_one_charge(f):
     assert sorted(row.status for row in rows) == [ChargeStatus.REFUNDED, ChargeStatus.SUCCEEDED]
 
 
+def test_reconcile_rejects_duplicate_refund_response_without_provider_id(f):
+    assert f.post("/orders", place_order("ord-duplicate-no-refund-id", "dni@example.com", 7150, "tok_visa")).status_code == 201
+    f.provider.create_charge("ord-duplicate-no-refund-id", 7150, "tok_visa")
+
+    def missing_id(charge_id, amount):
+        return paylink.Refund(
+            id="",
+            charge_id=charge_id,
+            amount=amount,
+            status="succeeded",
+            created_at=f.clock.now(),
+        )
+
+    f.provider.create_refund = missing_id
+    report = f.service.reconcile()
+
+    assert report.unresolved == ["ord-duplicate-no-refund-id"]
+    assert f.service.get("ord-duplicate-no-refund-id").status == Status.PAID
+    assert f.provider.list_refunds("") == []
+
+
 def test_reconcile_recovers_a_duplicate_refund_after_its_response_is_lost(f):
     assert f.post("/orders", place_order("ord-duplicate-lost", "dl@example.com", 7200, "tok_visa")).status_code == 201
     duplicate = f.provider.create_charge("ord-duplicate-lost", 7200, "tok_visa")
@@ -368,3 +446,119 @@ def test_reconcile_does_not_settle_a_mismatched_amount(f):
     assert report.settled == []
     assert report.unresolved == ["ord-mismatch"]
     assert f.service.get("ord-mismatch").status == Status.PENDING
+
+
+def test_reconcile_rejects_a_snapshot_with_duplicate_provider_ids(f):
+    assert f.post("/orders", place_order("ord-duplicate-id", "di@example.com", 8200, "tok_3ds")).status_code == 201
+    duplicate = f.provider.charges[0]
+    f.provider.charges.append(
+        paylink.Charge(
+            id=duplicate.id,
+            reference=duplicate.reference,
+            amount=duplicate.amount,
+            currency=duplicate.currency,
+            status="succeeded",
+            created_at=duplicate.created_at,
+            updated_at=duplicate.updated_at,
+        )
+    )
+
+    report = f.service.reconcile()
+
+    assert report.settled == []
+    assert report.unresolved == ["ord-duplicate-id"]
+    assert f.service.get("ord-duplicate-id").status == Status.PENDING
+
+
+def test_refund_rejects_a_different_charge_id_even_when_other_fields_match(f):
+    f.service.place_order(PlaceOrderInput("ord-wrong-id", "a@example.com", 1000, "tok_visa"))
+    actual = f.provider.charges[0]
+    f.provider.get_charge = lambda _: replace(actual, id="ch_unrelated")
+    assert f.post("/orders/ord-wrong-id/refund").status_code == 409
+    assert f.service.get("ord-wrong-id").status == Status.PAID
+    assert f.provider.refunds == []
+
+
+@pytest.mark.parametrize("status", ["processing", "requires_action", "future_status"])
+def test_unsettled_charge_blocks_duplicate_refund_repair(f, status):
+    f.service.place_order(PlaceOrderInput("ord-unsettled", "a@example.com", 1000, "tok_visa"))
+    f.provider.create_charge("ord-unsettled", 1000, "tok_visa")
+    unsettled = f.provider.create_charge("ord-unsettled", 1000, "tok_visa")
+    unsettled.status = status
+    before = list(f.service.charges("ord-unsettled"))
+    report = f.service.reconcile()
+    assert report.unresolved == ["ord-unsettled"]
+    assert report.settled == []
+    assert f.provider.refunds == []
+    assert len(f.service.charges("ord-unsettled")) == len(before)
+
+
+def test_duplicate_refund_records_cannot_masquerade_as_full_refund(f):
+    f.service.place_order(PlaceOrderInput("ord-repeat-refund-id", "a@example.com", 1000, "tok_visa"))
+    refund = f.provider.create_refund(f.provider.charges[0].id, 500)
+    f.provider.refunds.append(refund)
+    assert f.post("/orders/ord-repeat-refund-id/refund").status_code == 500
+    assert f.service.get("ord-repeat-refund-id").status == Status.PAID
+    assert len(f.provider.refunds) == 2
+
+
+@pytest.mark.parametrize("problem", ["unavailable", "malformed", "orphan"])
+def test_bad_snapshot_leaves_all_local_state_untouched(f, problem):
+    f.service.place_order(PlaceOrderInput("ord-snapshot", "a@example.com", 1000, "tok_3ds"))
+    if problem == "unavailable":
+        def unavailable(_):
+            raise paylink.PaylinkError("incomplete snapshot")
+        f.provider.list_refunds = unavailable
+    elif problem == "malformed":
+        f.provider.list_refunds = lambda _: [None]
+    else:
+        f.provider.refunds.append(paylink.Refund(
+            id="rf_orphan", charge_id="ch_missing", amount=1000,
+            status="succeeded", created_at=f.clock.now(),
+        ))
+    report = f.service.reconcile()
+    assert report.unresolved == ["ord-snapshot"]
+    assert report.settled == []
+    assert f.service.get("ord-snapshot").status == Status.PENDING
+
+
+@pytest.mark.parametrize("timestamp", [123, "not-a-date"])
+def test_http_charge_payload_error_reaches_pending_recovery(f, timestamp):
+    from orders.tests.test_paylink_client import Response, Session, charge
+
+    body = charge("ch_malformed", "ord-http-malformed")
+    body["created_at"] = timestamp
+    client = paylink.Client("https://paylink.test", sleep=lambda _: None)
+    client._session = Session([Response(201, body) for _ in range(3)])
+    f.service.provider = client
+    response = f.post("/orders", place_order("ord-http-malformed", "a@example.com", 1000, "tok_visa"))
+    assert response.status_code == 201
+    assert response.json()["status"] == Status.PENDING
+    record = f.service.charges("ord-http-malformed")[0]
+    assert record.status == ChargeStatus.UNKNOWN
+    assert "created_at" in record.last_error
+    assert len({call[2]["headers"]["Idempotency-Key"] for call in client._session.calls}) == 1
+
+
+@pytest.mark.parametrize("problem", ["missing_id", "invalid_time"])
+def test_http_refund_payload_error_preserves_paid_state_without_reposting(f, problem):
+    from orders.tests.test_paylink_client import Response, Session, charge, refund
+
+    f.service.place_order(PlaceOrderInput("ord-http-refund", "a@example.com", 1000, "tok_visa"))
+    charge_id = f.provider.charges[0].id
+    body = refund()
+    body["charge_id"] = charge_id
+    if problem == "missing_id":
+        del body["id"]
+    else:
+        body["created_at"] = 123
+    client = paylink.Client("https://paylink.test", sleep=lambda _: None)
+    client._session = Session([
+        Response(200, charge(charge_id, "ord-http-refund")),
+        Response(200, {"data": []}),
+        Response(201, body),
+    ])
+    f.service.provider = client
+    assert f.post("/orders/ord-http-refund/refund").status_code == 500
+    assert f.service.get("ord-http-refund").status == Status.PAID
+    assert len([call for call in client._session.calls if call[0] == "POST"]) == 1

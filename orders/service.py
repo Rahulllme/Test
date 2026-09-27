@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Protocol
 
 from django.db import IntegrityError, transaction
@@ -106,8 +107,15 @@ class Service:
 
             error = self._validate_charge(provider_charge, stored)
             if error:
+                provider_id = ""
+                if (
+                    isinstance(provider_charge, paylink.Charge)
+                    and isinstance(provider_charge.id, str)
+                    and provider_charge.id.strip()
+                ):
+                    provider_id = provider_charge.id
                 self._finish_charge(
-                    stored, charge_row, provider_charge.id, ChargeStatus.UNKNOWN, attempt, error
+                    stored, charge_row, provider_id, ChargeStatus.UNKNOWN, attempt, error
                 )
                 return stored
             if provider_charge.status == "succeeded":
@@ -143,13 +151,70 @@ class Service:
         stored.updated_at = self.clock.now()
         return stored
 
-    def _validate_charge(self, charge: paylink.Charge, order: Order) -> str:
-        if not charge.id:
+    def _validate_charge_shape(self, charge: paylink.Charge) -> str:
+        if not isinstance(charge, paylink.Charge):
+            return "provider returned an invalid charge object"
+        if not isinstance(charge.id, str) or not charge.id.strip():
             return "provider returned a charge without an id"
-        if charge.reference != order.order_no:
+        if not isinstance(charge.reference, str) or not charge.reference:
+            return "provider returned an invalid charge reference"
+        if isinstance(charge.amount, bool) or not isinstance(charge.amount, int) or charge.amount <= 0:
+            return "provider returned an invalid charge amount"
+        if (
+            isinstance(charge.refunded_amount, bool)
+            or not isinstance(charge.refunded_amount, int)
+            or charge.refunded_amount < 0
+        ):
+            return "provider returned an invalid refunded amount"
+        if not isinstance(charge.currency, str) or not charge.currency:
+            return "provider returned an invalid charge currency"
+        if not isinstance(charge.status, str) or not charge.status.strip():
+            return "provider returned an invalid charge status"
+        if (
+            not isinstance(charge.created_at, datetime)
+            or charge.created_at.tzinfo is None
+            or not isinstance(charge.updated_at, datetime)
+            or charge.updated_at.tzinfo is None
+            or charge.updated_at < charge.created_at
+        ):
+            return "provider returned invalid charge timestamps"
+        return ""
+
+    def _validate_charge(self, charge: paylink.Charge, order: Order) -> str:
+        error = self._validate_charge_shape(charge)
+        if error:
+            return error
+        if not isinstance(charge.reference, str) or charge.reference != order.order_no:
             return "provider returned a mismatched reference"
-        if charge.amount != order.amount_jpy or charge.currency != "JPY":
+        if (
+            charge.amount != order.amount_jpy
+            or charge.currency != "JPY"
+        ):
             return "provider returned a mismatched amount or currency"
+        return ""
+
+    def _validate_refund(
+        self,
+        refund: paylink.Refund,
+        charge_id: str | None = None,
+        amount: int | None = None,
+    ) -> str:
+        if not isinstance(refund, paylink.Refund):
+            return "provider returned an invalid refund object"
+        if not isinstance(refund.id, str) or not refund.id.strip():
+            return "provider returned a refund without an id"
+        if not isinstance(refund.charge_id, str) or not refund.charge_id.strip():
+            return "provider returned a refund without a charge id"
+        if charge_id is not None and refund.charge_id != charge_id:
+            return "provider returned a refund for a different charge"
+        if isinstance(refund.amount, bool) or not isinstance(refund.amount, int) or refund.amount <= 0:
+            return "provider returned an invalid refund amount"
+        if amount is not None and refund.amount != amount:
+            return "provider returned a refund for a different amount"
+        if not isinstance(refund.status, str) or not refund.status.strip():
+            return "provider returned an invalid refund status"
+        if not isinstance(refund.created_at, datetime) or refund.created_at.tzinfo is None:
+            return "provider returned an invalid refund timestamp"
         return ""
 
     def _finish_charge(
@@ -213,21 +278,34 @@ class Service:
                 raise Conflict()
             charge = candidates[0]
             provider_charge = self.provider.get_charge(charge.provider_charge_id)
-            if self._validate_charge(provider_charge, value) or provider_charge.status != "succeeded":
+            if (
+                self._validate_charge(provider_charge, value)
+                or provider_charge.id != charge.provider_charge_id
+                or provider_charge.status != "succeeded"
+            ):
                 raise Conflict()
 
             refunds = self.provider.list_refunds(charge.provider_charge_id)
+            if not isinstance(refunds, list):
+                raise paylink.PaylinkError("paylink: invalid refund list")
+            refund_ids = set()
+            for item in refunds:
+                error = self._validate_refund(item, charge.provider_charge_id)
+                if error:
+                    raise paylink.PaylinkError(f"paylink: {error}")
+                if item.id in refund_ids or item.created_at < provider_charge.created_at:
+                    raise paylink.PaylinkError("paylink: contradictory refund history")
+                refund_ids.add(item.id)
+                if item.status not in ("succeeded", "failed"):
+                    raise paylink.PaylinkError("paylink: unresolved refund status")
             refunded = sum(item.amount for item in refunds if item.status == "succeeded")
             if refunded not in (0, value.amount_jpy):
                 raise Conflict()
             if refunded == 0:
                 refund = self.provider.create_refund(charge.provider_charge_id, value.amount_jpy)
-                if (
-                    refund.charge_id != charge.provider_charge_id
-                    or refund.amount != value.amount_jpy
-                    or refund.status != "succeeded"
-                ):
-                    raise paylink.PaylinkError("paylink: invalid refund response")
+                error = self._validate_refund(refund, charge.provider_charge_id, value.amount_jpy)
+                if error or refund.status != "succeeded":
+                    raise paylink.PaylinkError(f"paylink: {error or 'refund did not succeed'}")
             now = self.clock.now()
             repository.update_charge(
                 charge.id, charge.provider_charge_id, ChargeStatus.REFUNDED, charge.attempts, "", now

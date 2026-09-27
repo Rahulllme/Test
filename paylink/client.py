@@ -6,6 +6,7 @@ the resulting safety decisions are documented in ``SOLUTION.md``.
 
 import hashlib
 import json
+import math
 import re
 import time
 from dataclasses import dataclass
@@ -30,15 +31,15 @@ class Charge:
     @classmethod
     def from_json(cls, data: dict) -> "Charge":
         return cls(
-            id=data.get("id", ""),
-            reference=data.get("reference", ""),
-            amount=data.get("amount", 0),
-            currency=data.get("currency", ""),
-            status=data.get("status", ""),
-            card_token=data.get("card_token", ""),
-            refunded_amount=data.get("refunded_amount", 0),
-            created_at=parse_time(data.get("created_at")),
-            updated_at=parse_time(data.get("updated_at")),
+            id=_string_field(data, "id", required=True),
+            reference=_string_field(data, "reference", required=True),
+            amount=_integer_field(data, "amount"),
+            currency=_string_field(data, "currency", required=True),
+            status=_string_field(data, "status", required=True),
+            card_token=_string_field(data, "card_token"),
+            refunded_amount=_integer_field(data, "refunded_amount", default=0),
+            created_at=_time_field(data, "created_at"),
+            updated_at=_time_field(data, "updated_at"),
         )
 
 
@@ -53,11 +54,11 @@ class Refund:
     @classmethod
     def from_json(cls, data: dict) -> "Refund":
         return cls(
-            id=data.get("id", ""),
-            charge_id=data.get("charge_id", ""),
-            amount=data.get("amount", 0),
-            status=data.get("status", ""),
-            created_at=parse_time(data.get("created_at")),
+            id=_string_field(data, "id", required=True),
+            charge_id=_string_field(data, "charge_id", required=True),
+            amount=_integer_field(data, "amount"),
+            status=_string_field(data, "status", required=True),
+            created_at=_time_field(data, "created_at"),
         )
 
 
@@ -79,6 +80,39 @@ class HTTPError(PaylinkError):
         super().__init__(f"paylink: http {status} ({code})")
         self.status = status
         self.code = code
+
+
+def _string_field(data: dict, name: str, required: bool = False) -> str:
+    if not isinstance(data, dict):
+        raise PaylinkError("paylink: invalid response shape")
+    value = data.get(name, "")
+    if not isinstance(value, str) or (required and not value.strip()):
+        raise PaylinkError(f"paylink: invalid {name}")
+    return value
+
+
+def _integer_field(data: dict, name: str, default=None) -> int:
+    if not isinstance(data, dict):
+        raise PaylinkError("paylink: invalid response shape")
+    value = data.get(name, default)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise PaylinkError(f"paylink: invalid {name}")
+    return value
+
+
+def _time_field(data: dict, name: str) -> datetime:
+    if not isinstance(data, dict):
+        raise PaylinkError("paylink: invalid response shape")
+    value = data.get(name)
+    if not isinstance(value, str) or not value:
+        raise PaylinkError(f"paylink: invalid {name}")
+    try:
+        parsed = parse_time(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise PaylinkError(f"paylink: invalid {name}") from exc
+    if parsed is None:
+        raise PaylinkError(f"paylink: invalid {name}")
+    return parsed
 
 
 class Client:
@@ -105,6 +139,7 @@ class Client:
         filtering has to happen after every page has been read.
         """
         values = [Charge.from_json(item) for item in self._list_pages("/v1/charges")]
+        _require_unique_ids(values, "charge")
         if not reference:
             return values
         return [value for value in values if value.reference == reference]
@@ -129,6 +164,7 @@ class Client:
 
     def list_refunds(self, charge_id: str) -> list[Refund]:
         values = [Refund.from_json(item) for item in self._list_pages("/v1/refunds")]
+        _require_unique_ids(values, "refund")
         if not charge_id:
             return values
         return [value for value in values if value.charge_id == charge_id]
@@ -148,7 +184,9 @@ class Client:
             if any(not isinstance(item, dict) for item in data):
                 raise PaylinkError("paylink: invalid list item")
             result.extend(data)
-            next_cursor = page.get("next_cursor") or ""
+            next_cursor = page.get("next_cursor")
+            if next_cursor is None:
+                next_cursor = ""
             if not isinstance(next_cursor, str):
                 raise PaylinkError("paylink: invalid next cursor")
             if not next_cursor:
@@ -217,10 +255,18 @@ def _key(operation: str, *parts: str) -> str:
     return f"orders-{operation}-" + hashlib.sha256(material).hexdigest()
 
 
+def _require_unique_ids(values, kind: str) -> None:
+    ids = [value.id for value in values]
+    if len(ids) != len(set(ids)):
+        raise PaylinkError(f"paylink: duplicate {kind} id in list response")
+
+
 def _retry_after(value: str | None) -> float:
     try:
         delay = float(value or "1")
-    except ValueError:
+    except (TypeError, ValueError):
+        delay = 1.0
+    if not math.isfinite(delay):
         delay = 1.0
     return max(0.0, min(delay, 30.0))
 
@@ -231,6 +277,11 @@ _FRACTION = re.compile(r"\.(\d+)")
 def parse_time(value: str | None) -> datetime | None:
     if not value:
         return None
+    if not isinstance(value, str):
+        raise TypeError("timestamp must be a string")
     # Python keeps microseconds; longer fractions are cut to six digits.
     value = _FRACTION.sub(lambda m: "." + m.group(1)[:6].ljust(6, "0"), value, count=1)
-    return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        raise ValueError("timestamp must include a timezone")
+    return parsed.astimezone(timezone.utc)
