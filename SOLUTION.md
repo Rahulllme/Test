@@ -99,16 +99,18 @@ produces no additional refunds or settled rows.
 
 ## Verification
 
-The test suite covers the original public API plus current decline and 3-D Secure statuses,
-repeat-refund idempotency, safe duplicate repair, amount mismatch handling, cursor pagination,
-stable charge idempotency keys after a lost response, non-retryable ambiguous refund failures,
-refund recovery after a lost response, API versioning, and `Retry-After` handling.
+The test suite covers the original public API plus current decline and 3-D Secure statuses, an
+explicit non-retried legacy 402 decline, recoverable temporary failures, malformed success
+responses, concurrent duplicate orders, concurrent and repeated refunds, safe duplicate repair,
+amount mismatch handling, cursor pagination, stable charge idempotency keys after a lost response,
+non-retryable ambiguous refund failures, refund recovery after a lost response, API versioning,
+and `Retry-After` handling.
 
 Commands run:
 
 ```text
 pytest -q
-18 passed
+23 passed
 
 python manage.py check
 System check identified no issues (0 silenced).
